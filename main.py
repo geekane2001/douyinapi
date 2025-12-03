@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # ==========================================================
-# 3. 核心签名函数
+# 3. 核心签名函数 (修改版)
 # ==========================================================
 
 async def get_signed_response(target_url: str, payload: dict, user_id: str):
@@ -75,38 +75,86 @@ async def get_signed_response(target_url: str, payload: dict, user_id: str):
     response_future = asyncio.Future()
     page = await browser_context.new_page()
 
+    # --- 1. 增加浏览器调试日志监听 ---
+    page.on("console", lambda msg: print(f"[Browser Console] {msg.text}"))
+    page.on("pageerror", lambda exc: print(f"[Browser Error] {exc}"))
+    
+    # 监听请求失败的情况 (如网络被墙、DNS错误)
+    page.on("requestfailed", lambda request: print(f"[Request Failed] {request.url} - {request.failure}"))
+
     async def handle_response(response):
-        if target_url in response.url and response.request.method == "POST":
-            print(f"✅ 成功捕获API响应: {response.status}")
+        # 打印所有相关的响应 URL，用于调试
+        if "lbs-locsight.bytedance.com" in response.url:
+            print(f"检测到流量: {response.status} | {response.url[:60]}...")
+
+        # 稍微放宽匹配条件，防止 query 参数顺序不同导致匹配失败
+        # 只要 url 包含 API 路径且是 POST 即可
+        api_path = target_url.split("?")[0] 
+        
+        if api_path in response.url and response.request.method == "POST":
+            print(f"✅ 成功捕获目标API响应: {response.status}")
             if not response_future.done():
                 try:
+                    # 如果状态码不是 200，也尝试读取 body 以查看错误信息
                     json_data = await response.json()
                     response_future.set_result(json_data)
                 except Exception as e:
+                    print(f"❌ 解析 JSON 失败: {e}")
                     response_future.set_exception(e)
     
     page.on("response", handle_response)
 
-    js_function = f"""
-        async (payload) => {{
-            const url = '{target_url}';
-            const body = JSON.stringify(payload);
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', url, true);
-            xhr.setRequestHeader('content-type', 'application/json');
-            xhr.setRequestHeader('user', '{user_id}');
-            xhr.send(body);
-        }}
-    """
-    
     try:
+        # --- 2. 关键修复：先导航到目标域名 ---
+        # 这确保了 Cookie 生效，并且 Origin/Referer 正确
+        print("正在导航到目标域名以初始化上下文...")
+        try:
+            # 访问一个该域名的轻量页面，或者直接访问首页
+            # timeout 设置短一点，我们不关心页面是否完全加载，只要域名对就行
+            await page.goto("https://lbs-locsight.bytedance.com/", timeout=10000, wait_until="domcontentloaded")
+        except Exception as e:
+            print(f"导航警告 (通常可忽略): {e}")
+
+        # --- 3. 执行请求 ---
+        js_function = f"""
+            async (payload) => {{
+                console.log("开始在浏览器内发送 XHR 请求...");
+                const url = '{target_url}';
+                const body = JSON.stringify(payload);
+                
+                try {{
+                    const response = await fetch(url, {{
+                        method: 'POST',
+                        headers: {{
+                            'content-type': 'application/json',
+                            'user': '{user_id}'
+                        }},
+                        body: body
+                    }});
+                    console.log("Fetch 请求完成，状态码: " + response.status);
+                    return "Request Sent";
+                }} catch (e) {{
+                    console.error("Fetch 请求发生错误: " + e);
+                    throw e;
+                }}
+            }}
+        """
+        
+        # 使用 fetch 替代 XMLHttpRequest (代码更现代，且容易调试)，Playwright 同样能捕获
+        print(f"正在注入 JS 请求: {target_url[:50]}...")
         await page.evaluate(js_function, payload)
-        result = await asyncio.wait_for(response_future, timeout=20.0)
+        
+        # 等待结果
+        result = await asyncio.wait_for(response_future, timeout=25.0)
         return result
+
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Request to target API timed out")
+        print("❌ 请求超时 - 未能捕获到匹配的响应包")
+        # 抛出超时异常时，查看控制台是否有相关错误日志
+        raise HTTPException(status_code=504, detail="Request timed out waiting for upstream API response. Check server logs.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
+        print(f"❌ 内部错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
     finally:
         await page.close()
 
