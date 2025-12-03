@@ -32,7 +32,7 @@ class PortraitPayload(BaseModel):
 # 注意：根据你的JS代码，第二个接口是 /topk/v2，它可能需要不同的参数
 # 这里根据第一个接口的结构创建了一个合理的模型，你可能需要根据实际情况调整
 class TopkPayload(BaseModel):
-    entity_type: int = 1
+    entity_type: int = 2
     entity_ids: List[str]
     locsight_fence: Fence
     locsight_time: Time
