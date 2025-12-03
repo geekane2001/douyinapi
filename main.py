@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -8,10 +9,26 @@ from typing import List, Optional, Any
 from playwright.async_api import async_playwright, BrowserContext
 
 # ==========================================================
-# 0. 日志配置
+# 0. 高级日志配置
 # ==========================================================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# 设置日志格式，显示时间、级别和具体消息
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - [%(levelname)s] - %(message)s',
+    datefmt='%H:%M:%S'
+)
 logger = logging.getLogger("LBS_Proxy")
+
+def log_json_preview(title: str, data: Any, max_len: int = 500):
+    """辅助函数：打印 JSON 预览，防止日志过长刷屏"""
+    try:
+        text = json.dumps(data, ensure_ascii=False)
+        if len(text) > max_len:
+            logger.info(f"{title}: {text[:max_len]}... (共 {len(text)} 字符)")
+        else:
+            logger.info(f"{title}: {text}")
+    except:
+        logger.info(f"{title}: [无法序列化数据]")
 
 # ==========================================================
 # 1. Pydantic 数据模型
@@ -88,17 +105,13 @@ app = FastAPI(lifespan=lifespan)
 USER_ID = '72410786115270758551286874604511870'
 ROOT_ACCOUNT_ID = '7241078611527075855'
 
-# 两个核心 API 地址
+# API 地址
 URL_TOPK_PRODUCTS = 'https://lbs-locsight.bytedance.com/lbs/analysis/v1/customize/busi_bible/locsight/topk/v2'
 URL_TOPK_STORES   = 'https://lbs-locsight.bytedance.com/lbs/analysis/v1/customize/busi_bible/locsight/topk/pois/v2'
 URL_PORTRAIT      = 'https://lbs-locsight.bytedance.com/lbs/analysis/v1/customize/busi_bible/locsight/arrive/portrait/v2'
 
 def build_payload(origin: GeneralPayload, etype: int, specific_ids: List[str] = None):
-    """
-    构造请求体。
-    - etype: 强制指定 entity_type
-    - specific_ids: 如果传入列表，则填充 entity_ids；否则该字段不发送。
-    """
+    """构造请求体"""
     data = {
         "entity_type": etype,
         "locsight_fence": {
@@ -109,11 +122,9 @@ def build_payload(origin: GeneralPayload, etype: int, specific_ids: List[str] = 
         "awe_type_code": origin.awe_type_code.dict()
     }
     
-    # 只有当明确传入 ID 列表时，才添加该字段
     if specific_ids is not None:
         data["entity_ids"] = specific_ids
         
-    # 可选：补充经纬度
     if origin.locsight_fence.center_lng:
         data["locsight_fence"]["center_lng"] = origin.locsight_fence.center_lng
     if origin.locsight_fence.center_lat:
@@ -122,9 +133,10 @@ def build_payload(origin: GeneralPayload, etype: int, specific_ids: List[str] = 
     return data
 
 async def fetch_api_in_browser(page, url, payload, tag="API"):
-    """执行浏览器 fetch"""
-    logger.info(f"⚡ [{tag}] POST -> {url.split('?')[0]}")
-    
+    """执行浏览器 fetch 并详细记录日志"""
+    logger.info(f"⚡ [{tag}] Request -> {url.split('?')[0]}")
+    # logger.debug(f"📦 [{tag}] Payload: {json.dumps(payload, ensure_ascii=False)}") # 调试时可解开
+
     js_code = f"""
         async (payload) => {{
             try {{
@@ -137,14 +149,45 @@ async def fetch_api_in_browser(page, url, payload, tag="API"):
                 try {{
                     return {{ status: response.status, json: JSON.parse(text) }};
                 }} catch (e) {{
-                    return {{ status: response.status, error: 'JSON Parse Error', text: text.substring(0, 100) }};
+                    return {{ status: response.status, error: 'JSON Parse Error', text: text.substring(0, 200) }};
                 }}
             }} catch(e) {{ 
                 return {{ status: -1, error: e.toString() }}; 
             }}
         }}
     """
-    return await page.evaluate(js_code, payload)
+    result = await page.evaluate(js_code, payload)
+    
+    # --- 详细响应日志 ---
+    status = result.get("status")
+    if status == 200:
+        json_data = result.get("json", {})
+        code = json_data.get("code")
+        msg = json_data.get("message") or json_data.get("msg")
+        
+        if code == 0:
+            logger.info(f"✅ [{tag}] Success (Code: 0)")
+            # 尝试打印数据条数概览
+            data_content = json_data.get("data", {})
+            if isinstance(data_content, dict):
+                keys = list(data_content.keys())
+                logger.info(f"   📄 [{tag}] Data Keys: {keys}")
+                if "product_operation" in data_content:
+                    count = len(data_content["product_operation"])
+                    logger.info(f"   📦 [{tag}] Found {count} products")
+                if "poi_operation" in data_content:
+                    count = len(data_content["poi_operation"])
+                    logger.info(f"   Store Count: {count}")
+                if "pois" in data_content:
+                    count = len(data_content["pois"])
+                    logger.info(f"   Store Relations: {count}")
+        else:
+            logger.error(f"❌ [{tag}] API Error: Code={code}, Msg={msg}")
+            log_json_preview(f"   [{tag}] Response Body", json_data)
+    else:
+        logger.error(f"❌ [{tag}] HTTP Fail: Status={status}, Error={result.get('error')}")
+    
+    return result
 
 # ==========================================================
 # 4. 接口路由
@@ -153,11 +196,9 @@ async def fetch_api_in_browser(page, url, payload, tag="API"):
 # --- 1. 获取门店列表 (Competitors) ---
 @app.post("/topk")
 async def get_topk_data(payload: GeneralPayload):
-    """
-    获取竞品列表。
-    URL: .../topk/pois/v2
-    Payload: 不带 entity_ids
-    """
+    """获取竞品列表"""
+    logger.info(f"📥 [Endpoint] /topk - Radius: {payload.locsight_fence.radius}")
+    
     if not browser_context: raise HTTPException(503, "Service not ready")
     page = await browser_context.new_page()
     
@@ -166,7 +207,6 @@ async def get_topk_data(payload: GeneralPayload):
         except: pass
 
         url = f"{URL_TOPK_STORES}?user={USER_ID}&root_account_id={ROOT_ACCOUNT_ID}"
-        # 强制不带 IDs
         clean_data = build_payload(payload, etype=1, specific_ids=None)
         
         result = await fetch_api_in_browser(page, url, clean_data, tag="TopK-Stores")
@@ -181,6 +221,8 @@ async def get_topk_data(payload: GeneralPayload):
 # --- 2. 获取用户画像 ---
 @app.post("/portrait")
 async def get_portrait_data(payload: PortraitPayload):
+    logger.info(f"📥 [Endpoint] /portrait - POI: {payload.awe_poi_id}")
+    
     if not browser_context: raise HTTPException(503)
     page = await browser_context.new_page()
     try:
@@ -201,62 +243,64 @@ async def get_portrait_data(payload: PortraitPayload):
 @app.post("/products")
 async def get_products_data(payload: GeneralPayload):
     """
-    两步走策略：
-    Step 1: 调 /topk/v2 获取商品列表 (得到 product_id)。
-    Step 2: 调 /topk/pois/v2 带上 entity_ids，获取门店关联关系。
-    Step 3: 组装返回。
+    Step 1: 调 /topk/v2 获取商品列表
+    Step 2: 调 /topk/pois/v2 (带IDs) 获取关联
+    Step 3: 组装
     """
-    logger.info(f"📥 [Request] /products (Radius: {payload.locsight_fence.radius})")
+    logger.info(f"📥 [Endpoint] /products - Radius: {payload.locsight_fence.radius}")
     
     if not browser_context: raise HTTPException(503, "Service not ready")
     page = await browser_context.new_page()
     
     try:
-        # 预导航
         try: await page.goto("https://lbs-locsight.bytedance.com/locsight/result", timeout=5000, wait_until="domcontentloaded")
         except: pass
 
         # === Step 1: 获取范围内热门商品 ===
-        # URL: .../topk/v2
-        # Payload: 不带 entity_ids, entity_type=2
         url_step1 = f"{URL_TOPK_PRODUCTS}?user={USER_ID}&root_account_id={ROOT_ACCOUNT_ID}"
         payload_step1 = build_payload(payload, etype=2, specific_ids=None)
         
         res1 = await fetch_api_in_browser(page, url_step1, payload_step1, tag="Step1-GetProducts")
         
         products_list = res1.get("json", {}).get("data", {}).get("product_operation", [])
-        logger.info(f"   ↳ Step 1 找到 {len(products_list)} 个商品")
-
+        
         if not products_list:
+            logger.warning("   ⚠️ Step 1 返回空商品列表，流程提前结束")
             return {"code": 0, "message": "success (no products)", "data": []}
+
+        # 打印部分商品信息以供调试
+        logger.info(f"   ✅ Step 1: 成功获取 {len(products_list)} 个商品")
+        if len(products_list) > 0:
+            sample_prod = products_list[0]
+            logger.info(f"      示例商品: {sample_prod.get('product_name')} (ID: {sample_prod.get('product_id')})")
 
         # 提取所有商品 ID
         product_ids = [str(p['product_id']) for p in products_list]
 
         # === Step 2: 获取这些商品所属的门店 ===
-        # URL: .../topk/pois/v2
-        # Payload: 带上 entity_ids (就是刚才拿到的商品ID), entity_type=2
         url_step2 = f"{URL_TOPK_STORES}?user={USER_ID}&root_account_id={ROOT_ACCOUNT_ID}"
+        # 这里的关键：entity_ids 必须传回去
         payload_step2 = build_payload(payload, etype=2, specific_ids=product_ids)
         
         res2 = await fetch_api_in_browser(page, url_step2, payload_step2, tag="Step2-GetRelations")
         
         stores_list = res2.get("json", {}).get("data", {}).get("pois", [])
-        logger.info(f"   ↳ Step 2 找到 {len(stores_list)} 个关联门店")
+        logger.info(f"   ✅ Step 2: 成功获取 {len(stores_list)} 个门店关联信息")
 
         # === Step 3: 数据组装 (Join) ===
-        # 建立 ID -> 商品详情 的映射
         product_map = {str(p['product_id']): p for p in products_list}
         
         final_result = []
         for store in stores_list:
+            store_name = store.get('name')
+            store_id = store.get('awe_poi_id')
+            
             store_obj = {
-                "awe_poi_id": store.get('awe_poi_id'),
-                "name": store.get('name'), # 拿到店名
+                "awe_poi_id": store_id,
+                "name": store_name,
                 "product_details": []
             }
             
-            # 这里的 related_entity_ids 就是商品 ID
             related_ids = store.get('related_entity_ids', [])
             
             for pid in related_ids:
@@ -264,11 +308,11 @@ async def get_products_data(payload: GeneralPayload):
                 if pid_str in product_map:
                     store_obj['product_details'].append(product_map[pid_str])
             
-            # 仅返回包含有效商品的门店
             if len(store_obj['product_details']) > 0:
                 final_result.append(store_obj)
 
-        logger.info(f"✅ [Finish] 组装完成，返回 {len(final_result)} 个门店数据")
+        logger.info(f"🎉 [Endpoint] /products 完成: 组装了 {len(final_result)} 个门店的套餐数据")
+        log_json_preview("   最终返回数据示例", final_result, max_len=300)
         
         return {
             "code": 0,
@@ -277,8 +321,7 @@ async def get_products_data(payload: GeneralPayload):
         }
 
     except Exception as e:
-        logger.error(f"❌ [Error] /products 流程失败: {e}")
-        # 返回空数据防止前端崩
+        logger.error(f"❌ [Endpoint] /products 崩溃: {str(e)}")
         return {"code": -1, "message": str(e), "data": []}
     finally:
         await page.close()
@@ -289,4 +332,6 @@ def read_root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # 获取环境变量端口，适配 Cloud Run
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
