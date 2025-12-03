@@ -37,7 +37,7 @@ class AweTypeCode(BaseModel):
 
 class GeneralPayload(BaseModel):
     entity_type: int = 1
-    # 接收端允许有这个字段，但我们在发送给上游时会根据步骤动态处理
+    # 接收 worker 传来的参数
     entity_ids: Optional[List[str]] = [] 
     locsight_fence: Fence
     locsight_time: Time
@@ -64,8 +64,6 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 [System] 服务启动中...")
     
     playwright_instance = await async_playwright().start()
-    
-    # 生产环境配置
     browser = await playwright_instance.chromium.launch(
         headless=True, 
         args=['--no-sandbox', '--disable-setuid-sandbox']
@@ -94,47 +92,48 @@ app = FastAPI(lifespan=lifespan)
 USER_ID = '72410786115270758551286874604511870'
 ROOT_ACCOUNT_ID = '7241078611527075855'
 
-# API 地址定义
-# 1. 获取商品列表 (不带entity_ids)
-URL_GET_PRODUCTS = 'https://lbs-locsight.bytedance.com/lbs/analysis/v1/customize/busi_bible/locsight/topk/v2'
-# 2. 获取门店列表 (分两种情况：带ID 和 不带ID)
-URL_GET_STORES   = 'https://lbs-locsight.bytedance.com/lbs/analysis/v1/customize/busi_bible/locsight/topk/pois/v2'
-# 3. 画像
-URL_PORTRAIT     = 'https://lbs-locsight.bytedance.com/lbs/analysis/v1/customize/busi_bible/locsight/arrive/portrait/v2'
+URL_TOPK_PRODUCTS = 'https://lbs-locsight.bytedance.com/lbs/analysis/v1/customize/busi_bible/locsight/topk/v2'
+URL_TOPK_STORES   = 'https://lbs-locsight.bytedance.com/lbs/analysis/v1/customize/busi_bible/locsight/topk/pois/v2'
+URL_PORTRAIT      = 'https://lbs-locsight.bytedance.com/lbs/analysis/v1/customize/busi_bible/locsight/arrive/portrait/v2'
 
 def build_payload(origin: GeneralPayload, etype: int, specific_ids: List[str] = None):
     """
     构造请求体。
-    - specific_ids: 
-        None -> 不发送 entity_ids 字段 (用于纯获取列表)
-        List -> 发送 entity_ids 字段 (用于反查关联)
     """
+    fence_data = {
+        "poi_id": origin.locsight_fence.poi_id,
+        "radius": origin.locsight_fence.radius
+    }
+    
+    # 经纬度检查与填充
+    if origin.locsight_fence.center_lng and origin.locsight_fence.center_lat:
+        fence_data["center_lng"] = origin.locsight_fence.center_lng
+        fence_data["center_lat"] = origin.locsight_fence.center_lat
+    else:
+        # ⚠️ 关键警告：如果缺少经纬度，某些接口可能会报错
+        logger.warning(f"⚠️ [Payload] 警告: 缺少经纬度 (center_lng/lat)，POI: {origin.locsight_fence.poi_id}")
+
     data = {
         "entity_type": etype,
-        "locsight_fence": {
-            "poi_id": origin.locsight_fence.poi_id,
-            "radius": origin.locsight_fence.radius
-        },
+        "locsight_fence": fence_data,
         "locsight_time": origin.locsight_time.dict(),
         "awe_type_code": origin.awe_type_code.dict()
     }
     
-    # 只有当 specific_ids 不为 None 时，才添加该字段
+    # 只有当明确传入 ID 列表时，才添加该字段
+    # 如果是 None，则不添加 key
     if specific_ids is not None:
         data["entity_ids"] = specific_ids
-        
-    # 补充经纬度 (如果有)
-    if origin.locsight_fence.center_lng:
-        data["locsight_fence"]["center_lng"] = origin.locsight_fence.center_lng
-    if origin.locsight_fence.center_lat:
-        data["locsight_fence"]["center_lat"] = origin.locsight_fence.center_lat
 
     return data
 
 async def fetch_api_in_browser(page, url, payload, tag="API"):
     """执行浏览器 fetch"""
+    # 🔍 调试关键：打印最终发送的 JSON
+    payload_str = json.dumps(payload, ensure_ascii=False)
     logger.info(f"⚡ [{tag}] Request -> {url.split('?')[0]}")
-    
+    logger.info(f"📦 [{tag}] Body -> {payload_str}") # 这里能看到到底发了什么
+
     js_code = f"""
         async (payload) => {{
             try {{
@@ -147,7 +146,7 @@ async def fetch_api_in_browser(page, url, payload, tag="API"):
                 try {{
                     return {{ status: response.status, json: JSON.parse(text) }};
                 }} catch (e) {{
-                    return {{ status: response.status, error: 'JSON Parse Error', text: text.substring(0, 100) }};
+                    return {{ status: response.status, error: 'JSON Parse Error', text: text.substring(0, 200) }};
                 }}
             }} catch(e) {{ 
                 return {{ status: -1, error: e.toString() }}; 
@@ -160,13 +159,12 @@ async def fetch_api_in_browser(page, url, payload, tag="API"):
 # 4. 接口路由
 # ==========================================================
 
-# --- 1. 获取门店列表 (纯门店) ---
+# --- 1. 获取门店列表 (Competitors) ---
 @app.post("/topk")
 async def get_topk_data(payload: GeneralPayload):
     """
-    场景：获取门店列表
-    URL: .../pois/v2
-    Payload: entity_type=1, 不带 entity_ids
+    URL: .../topk/pois/v2
+    Payload: 必须不带 entity_ids
     """
     logger.info(f"📥 [Endpoint] /topk (门店列表) - Radius: {payload.locsight_fence.radius}")
     
@@ -177,14 +175,21 @@ async def get_topk_data(payload: GeneralPayload):
         try: await page.goto("https://lbs-locsight.bytedance.com/locsight/result", timeout=5000, wait_until="domcontentloaded")
         except: pass
 
-        url = f"{URL_GET_STORES}?user={USER_ID}&root_account_id={ROOT_ACCOUNT_ID}"
-        # 强制不带 IDs
+        url = f"{URL_TOPK_STORES}?user={USER_ID}&root_account_id={ROOT_ACCOUNT_ID}"
+        
+        # 构造 Payload (specific_ids=None 确保没有该字段)
         clean_data = build_payload(payload, etype=1, specific_ids=None)
+        
+        # 双重保险：强制删除 entity_ids 键 (如果 build_payload 漏了)
+        clean_data.pop("entity_ids", None)
         
         result = await fetch_api_in_browser(page, url, clean_data, tag="TopK-Stores-NoID")
         
         if result.get("status") == 200:
-            return result.get("json")
+            json_res = result.get("json", {})
+            if json_res.get("code") != 0:
+                logger.error(f"❌ [TopK Error] Code: {json_res.get('code')}, Msg: {json_res.get('message')}")
+            return json_res
         else:
             raise HTTPException(500, f"Upstream Error: {result}")
     finally:
@@ -193,8 +198,6 @@ async def get_topk_data(payload: GeneralPayload):
 # --- 2. 获取用户画像 ---
 @app.post("/portrait")
 async def get_portrait_data(payload: PortraitPayload):
-    logger.info(f"📥 [Endpoint] /portrait - POI: {payload.awe_poi_id}")
-    
     if not browser_context: raise HTTPException(503)
     page = await browser_context.new_page()
     try:
@@ -214,13 +217,7 @@ async def get_portrait_data(payload: PortraitPayload):
 # --- 3. 获取商品套餐 (串行关联逻辑) ---
 @app.post("/products")
 async def get_products_data(payload: GeneralPayload):
-    """
-    严格按照用户指定的逻辑执行：
-    Step 1: 调 /topk/v2 (不带IDs) -> 获取商品列表
-    Step 2: 调 /topk/pois/v2 (带IDs) -> 获取这些商品关联的门店
-    Step 3: 组装返回
-    """
-    logger.info(f"📥 [Endpoint] /products (商品套餐关联) - Radius: {payload.locsight_fence.radius}")
+    logger.info(f"📥 [Endpoint] /products - Radius: {payload.locsight_fence.radius}")
     
     if not browser_context: raise HTTPException(503, "Service not ready")
     page = await browser_context.new_page()
@@ -229,73 +226,51 @@ async def get_products_data(payload: GeneralPayload):
         try: await page.goto("https://lbs-locsight.bytedance.com/locsight/result", timeout=5000, wait_until="domcontentloaded")
         except: pass
 
-        # === Step 1: 获取指定范围内的商品 ===
-        # URL: .../topk/v2
-        # Payload: entity_type=2, 不带 entity_ids
-        url_step1 = f"{URL_GET_PRODUCTS}?user={USER_ID}&root_account_id={ROOT_ACCOUNT_ID}"
+        # === Step 1: 获取商品 (无 ID) ===
+        url_step1 = f"{URL_TOPK_PRODUCTS}?user={USER_ID}&root_account_id={ROOT_ACCOUNT_ID}"
         payload_step1 = build_payload(payload, etype=2, specific_ids=None)
+        payload_step1.pop("entity_ids", None) # 双重保险
         
-        res1 = await fetch_api_in_browser(page, url_step1, payload_step1, tag="Step1-GetRawProducts")
+        res1 = await fetch_api_in_browser(page, url_step1, payload_step1, tag="Step1-Products")
         
-        # 提取商品列表
         products_list = res1.get("json", {}).get("data", {}).get("product_operation", [])
         
         if not products_list:
-            logger.warning("   ⚠️ Step 1 返回空商品列表，流程结束")
+            logger.warning("   ⚠️ Step 1 无商品，结束")
             return {"code": 0, "message": "success (no products)", "data": []}
 
-        logger.info(f"   ✅ Step 1: 成功获取 {len(products_list)} 个商品")
-
-        # 提取所有商品 ID，准备用于 Step 2
+        # === Step 2: 获取关联门店 (带 ID) ===
         product_ids = [str(p['product_id']) for p in products_list]
-
-        # === Step 2: 获取门店列表并含有门店关联的商品id ===
-        # URL: .../topk/pois/v2
-        # Payload: entity_type=2, 带 entity_ids !!!
-        url_step2 = f"{URL_GET_STORES}?user={USER_ID}&root_account_id={ROOT_ACCOUNT_ID}"
+        
+        url_step2 = f"{URL_TOPK_STORES}?user={USER_ID}&root_account_id={ROOT_ACCOUNT_ID}"
         payload_step2 = build_payload(payload, etype=2, specific_ids=product_ids)
         
-        res2 = await fetch_api_in_browser(page, url_step2, payload_step2, tag="Step2-GetStoresWithProductIDs")
+        res2 = await fetch_api_in_browser(page, url_step2, payload_step2, tag="Step2-Relations")
         
-        # 提取门店列表 (包含 related_entity_ids)
         stores_list = res2.get("json", {}).get("data", {}).get("pois", [])
-        logger.info(f"   ✅ Step 2: 成功获取 {len(stores_list)} 个关联门店")
 
-        # === Step 3: 数据组装 (关联门店和商品) ===
-        # 建立 ID -> 商品详情 的映射
+        # === Step 3: 组装 ===
         product_map = {str(p['product_id']): p for p in products_list}
-        
         final_result = []
         for store in stores_list:
             store_obj = {
                 "awe_poi_id": store.get('awe_poi_id'),
-                "name": store.get('name'), # 获取店名
-                "product_details": []      # 准备填充商品
+                "name": store.get('name'),
+                "product_details": []
             }
-            
-            # 取出该门店关联的商品 ID 列表
-            related_ids = store.get('related_entity_ids', [])
-            
-            # 根据 ID 从 map 中把商品详情找出来放进去
-            for pid in related_ids:
+            for pid in store.get('related_entity_ids', []):
                 pid_str = str(pid)
                 if pid_str in product_map:
                     store_obj['product_details'].append(product_map[pid_str])
             
-            # 只返回有商品的门店 (可选逻辑)
             if len(store_obj['product_details']) > 0:
                 final_result.append(store_obj)
 
-        logger.info(f"🎉 [Endpoint] /products 完成: 组装了 {len(final_result)} 个门店数据")
-        
-        return {
-            "code": 0,
-            "message": "success",
-            "data": final_result
-        }
+        logger.info(f"🎉 组装完成: {len(final_result)} 门店")
+        return { "code": 0, "message": "success", "data": final_result }
 
     except Exception as e:
-        logger.error(f"❌ [Error] /products 流程失败: {e}")
+        logger.error(f"❌ [Error] {e}")
         return {"code": -1, "message": str(e), "data": []}
     finally:
         await page.close()
