@@ -1,26 +1,28 @@
 import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from typing import List, Optional
 from playwright.async_api import async_playwright, BrowserContext
 
 # ==========================================================
-# 1. Pydantic 模型：定义请求体的数据结构，用于自动验证
+# 1. Pydantic 数据模型
 # ==========================================================
 
 class Fence(BaseModel):
     poi_id: str
     radius: int
+    center_lng: Optional[float] = None
+    center_lat: Optional[float] = None
 
 class Time(BaseModel):
-    raw_text: str # e.g., "2025-10"
+    raw_text: str 
 
 class AweTypeCode(BaseModel):
     code: str
     level: int
 
-# --- Payload for the 'portrait' API ---
+# --- 模型：画像接口 ---
 class PortraitPayload(BaseModel):
     awe_poi_id: str
     locsight_fence: Fence
@@ -28,168 +30,161 @@ class PortraitPayload(BaseModel):
     awe_type_code: AweTypeCode
     entity_type: int = 1
 
-# --- Payload for the 'topk' API ---
-# 注意：根据你的JS代码，第二个接口是 /topk/v2，它可能需要不同的参数
-# 这里根据第一个接口的结构创建了一个合理的模型，你可能需要根据实际情况调整
+# --- 模型：门店列表接口 (TopK) ---
 class TopkPayload(BaseModel):
     entity_type: int = 1
-    entity_ids: List[str]
+    entity_ids: List[str] = []
+    locsight_fence: Fence
+    locsight_time: Time
+    awe_type_code: AweTypeCode
+
+# --- 模型：商品套餐接口 (Products) ---
+class ProductPayload(BaseModel):
+    entity_type: int = 2 # 核心区别：必须是 2
+    entity_ids: List[str] = []
     locsight_fence: Fence
     locsight_time: Time
     awe_type_code: AweTypeCode
 
 # ==========================================================
-# 2. 全局变量和 Playwright 生命周期管理
+# 2. 全局变量与生命周期
 # ==========================================================
 
-# 存储 Playwright 实例的全局变量
 playwright_instance = None
 browser_context: Optional[BrowserContext] = None
 AUTH_FILE = "auth.json"
 
-# 使用 FastAPI 的 lifespan 管理器，在服务启动时开启浏览器，在关闭时关闭
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global playwright_instance, browser_context
-    print("服务启动中，正在初始化 Playwright...")
+    print("🚀 服务启动中...")
+    
     playwright_instance = await async_playwright().start()
-    browser = await playwright_instance.chromium.launch(headless=True) # 在 Docker 中必须是 headless
-    browser_context = await browser.new_context(storage_state=AUTH_FILE)
-    print("Playwright 初始化完成，浏览器已准备就绪。")
+    
+    # 生产环境必须添加 --no-sandbox
+    browser = await playwright_instance.chromium.launch(
+        headless=True, 
+        args=['--no-sandbox', '--disable-setuid-sandbox']
+    )
+    
+    try:
+        print(f"📂 加载 Cookie: {AUTH_FILE}")
+        browser_context = await browser.new_context(storage_state=AUTH_FILE)
+        print("✅ 浏览器上下文就绪")
+    except Exception as e:
+        print(f"⚠️ 加载 auth.json 失败: {e}")
+        browser_context = await browser.new_context()
+
     yield
-    print("服务关闭中，正在关闭 Playwright...")
-    await browser_context.close()
-    await playwright_instance.stop()
-    print("Playwright 已成功关闭。")
+    
+    print("🛑 服务关闭中...")
+    if browser_context: await browser_context.close()
+    if playwright_instance: await playwright_instance.stop()
 
 app = FastAPI(lifespan=lifespan)
 
 # ==========================================================
-# 3. 核心签名函数 (修改版)
+# 3. 核心签名函数 (浏览器内执行)
 # ==========================================================
 
 async def get_signed_response(target_url: str, payload: dict, user_id: str):
     if not browser_context:
-        raise HTTPException(status_code=503, detail="Playwright service not ready")
+        raise HTTPException(status_code=503, detail="Service not ready")
 
-    response_future = asyncio.Future()
     page = await browser_context.new_page()
+    response_future = asyncio.Future()
 
-    # --- 1. 增加浏览器调试日志监听 ---
-    page.on("console", lambda msg: print(f"[Browser Console] {msg.text}"))
-    page.on("pageerror", lambda exc: print(f"[Browser Error] {exc}"))
-    
-    # 监听请求失败的情况 (如网络被墙、DNS错误)
-    page.on("requestfailed", lambda request: print(f"[Request Failed] {request.url} - {request.failure}"))
-
+    # 监听响应
     async def handle_response(response):
-        # 打印所有相关的响应 URL，用于调试
-        if "lbs-locsight.bytedance.com" in response.url:
-            print(f"检测到流量: {response.status} | {response.url[:60]}...")
-
-        # 稍微放宽匹配条件，防止 query 参数顺序不同导致匹配失败
-        # 只要 url 包含 API 路径且是 POST 即可
-        api_path = target_url.split("?")[0] 
-        
-        if api_path in response.url and response.request.method == "POST":
-            print(f"✅ 成功捕获目标API响应: {response.status}")
+        # 模糊匹配 URL 路径
+        req_path = target_url.split('?')[0]
+        if req_path in response.url and response.request.method == "POST":
+            print(f"🔍 捕获响应: {response.status} | {req_path.split('/')[-1]}")
             if not response_future.done():
-                try:
-                    # 如果状态码不是 200，也尝试读取 body 以查看错误信息
-                    json_data = await response.json()
-                    response_future.set_result(json_data)
-                except Exception as e:
-                    print(f"❌ 解析 JSON 失败: {e}")
-                    response_future.set_exception(e)
-    
+                if response.ok:
+                    try:
+                        response_future.set_result(await response.json())
+                    except Exception as e:
+                        response_future.set_exception(e)
+                else:
+                    try:
+                        err = await response.text()
+                        response_future.set_exception(Exception(f"API Error {response.status}: {err[:100]}"))
+                    except:
+                        response_future.set_exception(Exception(f"API Error {response.status}"))
+
     page.on("response", handle_response)
 
     try:
-        # --- 2. 关键修复：先导航到目标域名 ---
-        # 这确保了 Cookie 生效，并且 Origin/Referer 正确
-        print("正在导航到目标域名以初始化上下文...")
+        # 1. 预导航：激活 Cookie 和 Origin
         try:
-            # 访问一个该域名的轻量页面，或者直接访问首页
-            # timeout 设置短一点，我们不关心页面是否完全加载，只要域名对就行
-            await page.goto("https://lbs-locsight.bytedance.com/", timeout=10000, wait_until="domcontentloaded")
-        except Exception as e:
-            print(f"导航警告 (通常可忽略): {e}")
+            await page.goto("https://lbs-locsight.bytedance.com/locsight/result", timeout=15000, wait_until="domcontentloaded")
+        except:
+            pass # 忽略导航超时，只要域名对了就行
 
-        # --- 3. 执行请求 ---
-        js_function = f"""
+        # 2. 注入 JS 发送请求 (利用浏览器的自动签名能力)
+        js_code = f"""
             async (payload) => {{
-                console.log("开始在浏览器内发送 XHR 请求...");
                 const url = '{target_url}';
-                const body = JSON.stringify(payload);
-                
-                try {{
-                    const response = await fetch(url, {{
-                        method: 'POST',
-                        headers: {{
-                            'content-type': 'application/json',
-                            'user': '{user_id}'
-                        }},
-                        body: body
-                    }});
-                    console.log("Fetch 请求完成，状态码: " + response.status);
-                    return "Request Sent";
-                }} catch (e) {{
-                    console.error("Fetch 请求发生错误: " + e);
-                    throw e;
-                }}
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', url, true);
+                xhr.setRequestHeader('content-type', 'application/json');
+                xhr.setRequestHeader('user', '{user_id}');
+                xhr.send(JSON.stringify(payload));
             }}
         """
+        await page.evaluate(js_code, payload)
         
-        # 使用 fetch 替代 XMLHttpRequest (代码更现代，且容易调试)，Playwright 同样能捕获
-        print(f"正在注入 JS 请求: {target_url[:50]}...")
-        await page.evaluate(js_function, payload)
-        
-        # 等待结果
+        # 3. 等待结果
         result = await asyncio.wait_for(response_future, timeout=25.0)
         return result
 
     except asyncio.TimeoutError:
-        print("❌ 请求超时 - 未能捕获到匹配的响应包")
-        # 抛出超时异常时，查看控制台是否有相关错误日志
-        raise HTTPException(status_code=504, detail="Request timed out waiting for upstream API response. Check server logs.")
+        raise HTTPException(status_code=504, detail="Request timed out")
     except Exception as e:
-        print(f"❌ 内部错误: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         await page.close()
 
 # ==========================================================
-# 4. FastAPI 接口端点
+# 4. 接口路由
 # ==========================================================
 
 USER_ID = '72410786115270758551286874604511870'
 ROOT_ACCOUNT_ID = '7241078611527075855'
 
-@app.post("/portrait")
-async def get_portrait_data(payload: PortraitPayload):
-    """
-    代理并签名 /arrive/portrait/v2 接口
-    """
-    base_url = 'https://lbs-locsight.bytedance.com/lbs/analysis/v1/customize/busi_bible/locsight/arrive/portrait/v2'
-    target_url = f"{base_url}?user={USER_ID}&root_account_id={ROOT_ACCOUNT_ID}"
-    
-    print(f"收到 /portrait 请求, poi_id: {payload.awe_poi_id}")
-    response_data = await get_signed_response(target_url, payload.dict(), USER_ID)
-    return response_data
-
+# --- 1. 获取门店列表 (竞品) ---
 @app.post("/topk")
 async def get_topk_data(payload: TopkPayload):
-    """
-    代理并签名 /topk/v2 接口 (注意：原始脚本是 /topk/pois/v2)
-    """
-    # 请确认这个URL是否正确，你的JS代码中是 /topk/v2
+    # URL 包含 /pois/v2
+    base_url = 'https://lbs-locsight.bytedance.com/lbs/analysis/v1/customize/busi_bible/locsight/topk/pois/v2'
+    target_url = f"{base_url}?user={USER_ID}&root_account_id={ROOT_ACCOUNT_ID}"
+    return await get_signed_response(target_url, payload.dict(), USER_ID)
+
+# --- 2. 获取商品套餐 (核心修复) ---
+@app.post("/products")
+async def get_products_data(payload: ProductPayload):
+    # URL 是 /topk/v2 (没有 pois)
     base_url = 'https://lbs-locsight.bytedance.com/lbs/analysis/v1/customize/busi_bible/locsight/topk/v2'
     target_url = f"{base_url}?user={USER_ID}&root_account_id={ROOT_ACCOUNT_ID}"
     
-    print(f"收到 /topk 请求, poi_id: {payload.locsight_fence.poi_id}")
-    response_data = await get_signed_response(target_url, payload.dict(), USER_ID)
-    return response_data
+    # 强制修正参数
+    data = payload.dict()
+    data['entity_type'] = 2 
+    
+    return await get_signed_response(target_url, data, USER_ID)
+
+# --- 3. 获取画像 ---
+@app.post("/portrait")
+async def get_portrait_data(payload: PortraitPayload):
+    base_url = 'https://lbs-locsight.bytedance.com/lbs/analysis/v1/customize/busi_bible/locsight/arrive/portrait/v2'
+    target_url = f"{base_url}?user={USER_ID}&root_account_id={ROOT_ACCOUNT_ID}"
+    return await get_signed_response(target_url, payload.dict(), USER_ID)
 
 @app.get("/")
 def read_root():
-    return {"status": "Signature service is running"}
+    return {"status": "ok", "endpoints": ["/topk", "/products", "/portrait"]}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
