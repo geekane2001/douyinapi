@@ -14,7 +14,7 @@ class Fence(BaseModel):
     radius: int
 
 class Time(BaseModel):
-    raw_text: str # e.g., "2023-10"
+    raw_text: str # e.g., "2025-10"
 
 class AweTypeCode(BaseModel):
     code: str
